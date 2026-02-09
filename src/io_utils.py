@@ -2,23 +2,28 @@ import cv2
 import os
 import tifffile as tiff
 import numpy as np
+import rasterio
 
 def load_image(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Path not found: {path}")
     
-    # Try tifffile first (better for drone orthos)
-    try:
-        img = tiff.imread(path)
-        # Convert RGB/RGBA to BGR for OpenCV
-        if len(img.shape) == 3 and img.shape[2] == 3:
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        elif len(img.shape) == 3 and img.shape[2] == 4:
-            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-        return img
-    except:
-        # Fallback to OpenCV standard
-        return cv2.imread(path)
+    # Use rasterio to load with georeference
+    with rasterio.open(path) as src:
+        img = src.read()
+        profile = src.profile
+        
+    # Rasterio reads as (bands, height, width), transpose to (height, width, bands)
+    if img.shape[0] == 3:  # RGB
+        img = np.transpose(img, (1, 2, 0))
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    elif img.shape[0] == 4:  # RGBA
+        img = np.transpose(img, (1, 2, 0))
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    else:
+        img = img[0]  # Single band, grayscale
+    
+    return img, profile
 
 def save_result(filename, image, output_dir):
     if not os.path.exists(output_dir):
