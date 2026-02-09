@@ -1,25 +1,35 @@
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
+import os
+import config
+from src.visualization import plot_image_with_mask
 
-def align_images_constrained(img_ref, img_to_align, mask_path=None):
+def align_images_constrained(img_ref, img_to_align, mask=None):
     """
     Aligns images using SIFT, but ONLY calculates features 
     inside the 'stable_mask' area.
     """
     print("Loading stable area mask...")
     # Load mask as grayscale (0 = Ignore, 255 = Include)
-    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if isinstance(mask, str):
+        mask = cv2.imread(mask, cv2.IMREAD_GRAYSCALE)
+    # Else assume it's already the array
     
     if mask is None:
-        print("Error: Could not load mask. Check path.")
+        print("Error: Could not load mask.")
         return img_to_align
         
     # Ensure mask is same size as reference image
+    ## Is this really necessary or even correct?
     if mask.shape != img_ref.shape[:2]:
         print("Resizing mask to match image dimensions...")
         mask = cv2.resize(mask, (img_ref.shape[1], img_ref.shape[0]), interpolation=cv2.INTER_NEAREST)
     else:
         print("No resizing needed")
+
+    # Plot the reference image with the mask overlay
+    plot_image_with_mask(img_ref, mask, title="Reference Image with Stable Mask Overlay", save_path=os.path.join(config.OUTPUT_DIR, "reference_with_mask_overlay.png"))
 
     print("Detecting features in STABLE areas only...")
     
@@ -54,6 +64,17 @@ def align_images_constrained(img_ref, img_to_align, mask_path=None):
             good_matches.append(m)
             
     print(f"Found {len(good_matches)} matches in stable terrain.")
+
+    idx1 = sorted({m.queryIdx for m in good_matches})
+    kp1_used = [kp1[i] for i in idx1]
+    
+    # Plot reference image with keypoints
+    img_with_keypoints = cv2.drawKeypoints(gray_ref, kp1_used, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+    plt.imshow(img_with_keypoints, cmap='gray')
+    plt.title("Keypoints on Grayscale Reference Image")
+    plt.axis('off')
+    plt.savefig(os.path.join(config.OUTPUT_DIR, "keypoints_on_grayscale.png"))
+    plt.show()
     
     if len(good_matches) < 10:
         print("Error: Not enough stable matches found!")
