@@ -1,15 +1,27 @@
 import os
 import cv2
-import tifffile
+from matplotlib import pyplot as plt
 import rasterio
 from rasterio.transform import Affine
 import numpy as np
+import re
 import config
 from src.geo_utils import rasterize_vector_mask
 from src.io_utils import load_image, save_result
 from src.alignment import align_images_constrained
-from src.processing import get_common_mask, crop_to_content, match_histograms, detect_landslide_changes
-from src.visualization import preview_images
+from src.processing import (
+    get_common_mask, crop_to_content, match_histograms, 
+    detect_landslide_changes, compute_dense_displacement,
+    process_image_pair
+)
+from src.visualization import plot_image_with_mask, plot_image_with_change_mask, preview_images, visualize_displacement_field
+
+def extract_date(path):
+    """Extract date from filename in format YYYY-MM-DD"""
+    fname = os.path.basename(path)
+    match = re.search(r'(\d{4}-\d{2}-\d{2})', fname)
+    return match.group(1) if match else fname
+
 
 def main():
     # --- 1.1 Preparation ---
@@ -19,19 +31,28 @@ def main():
     if not os.path.exists(config.RASTER_MASK_PATH):
         if os.path.exists(config.VECTOR_MASK_PATH):
             print("Vector mask found. Converting to raster...")
+            # Get sorted image paths
+            image_paths = config.get_sorted_image_paths()
+            if not image_paths:
+                print("Error: No images found")
+                return
+            ref_img_path = image_paths[0]
             rasterize_vector_mask(
                 vector_path=config.VECTOR_MASK_PATH,
-                reference_tif_path=config.IMG1_PATH,
+                reference_tif_path=ref_img_path,
                 output_path=config.RASTER_MASK_PATH
             )
         else:
             print("Error: No vector file found")
             return
     
-    # --- 1.2 Loading ---
-    print(f"Loading images from: {config.BASE_DIR}")
-    img1, profile1 = load_image(config.IMG1_PATH)
-    img2, profile2 = load_image(config.IMG2_PATH)
+    # --- 1.2 Loading Images (sorted by date) ---
+    print(f"\nLoading images from folder: {config.INPUT_FOLDER}")
+    image_paths = config.get_sorted_image_paths()
+    
+    if len(image_paths) < 2:
+        print("Error: Need at least 2 images to process")
+        return
 
     # Load stable mask
     if os.path.exists(config.RASTER_MASK_PATH):
@@ -39,88 +60,72 @@ def main():
     else:
         mask = None
 
-    # --- 2. Alignment ---
-    # This step warps img2 to match img1 perfectly based on the stable ground
-    print(f"Aligning images using mask: {config.RASTER_MASK_PATH}")
-    
-    if os.path.exists(config.RASTER_MASK_PATH):
-        # We update 'img2' to be the new, aligned version
-        img2 = align_images_constrained(img1, img2, config.RASTER_MASK_PATH)
-    else:
-        print("WARNING: Stable mask not found at path. Skipping alignment!")
-        # If you don't have a mask yet, you can fallback to the auto-alignment 
-        # from the previous step, or just proceed if they are already aligned.
+    # Load all images and profiles
+    print(f"\nLoading {len(image_paths)} images (sorted by date)...")
+    images = []
+    profiles = []
+    for i, img_path in enumerate(image_paths):
+        img, profile = load_image(img_path)
+        images.append(img)
+        profiles.append(profile)
+        img_name = os.path.basename(img_path)
+        ref_marker = " (REFERENCE - Oldest)" if i == 0 else ""
+        print(f"  [{i}] {img_name}{ref_marker}")
 
-    # --- 3. Pre-Processing (Intersection & Crop) ---
-    print("Calculating common area...")
-    # Now that they are aligned, we find the overlapping pixels
-    common_mask = get_common_mask(img1, img2)
-    
-    # Crop both images to the valid data area (removes black borders)
-    img1_crop, rect = crop_to_content(img1, common_mask)
-    
-    # Apply exactly the same crop to the aligned img2
-    x, y, w, h = rect
-    img2_crop = img2[y:y+h, x:x+w]
-    
-    # Crop the mask to the same extent
-    if mask is not None:
-        mask_crop = mask[y:y+h, x:x+w]
-    else:
-        mask_crop = None
-    
-    # Save the aligned and intersected image as georeferenced TIFF
-    base_name = os.path.splitext(os.path.basename(config.IMG2_PATH))[0]
-    output_filename = f"{base_name}_aligned.tif"
-    output_path = os.path.join(config.OUTPUT_DIR, output_filename)
-    new_transform = profile2['transform'] * Affine.translation(x, y)
-    profile2.update(width=w, height=h, transform=new_transform, count=3, dtype=img2_crop.dtype)
-    with rasterio.open(output_path, 'w', **profile2) as dst:
-        # Transpose to (bands, height, width)
-        dst.write(np.transpose(img2_crop, (2, 0, 1)))
-    print(f"Saved georeferenced aligned and intersected image to: {output_path}")
-    
-    #-- 4. Lighting Correction ---
-    print("Harmonizing lighting...")
-    # Match the brightness of Date 2 to Date 1
-    img2_corrected = match_histograms(img2_crop, img1_crop)
+    # --- 2. Alignment (Each to Previous) ---
+    print(f"\nAligning {len(images)} images to previous image using mask...")
+    aligned_images = [images[0]]
+    print(f"  Image 0: {extract_date(image_paths[0])} (Reference - no alignment needed)")
+    for i in range(1, len(images)):
+        prev_img = aligned_images[i-1]
+        curr_img = images[i]
+        prev_date = extract_date(image_paths[i-1])
+        curr_date = extract_date(image_paths[i])
+        print(f"  Aligning image {i}: {curr_date} to previous: {prev_date} ...")
+        img_aligned, kp1_used, gray_ref = align_images_constrained(prev_img, curr_img, config.RASTER_MASK_PATH)
+        aligned_images.append(img_aligned)
+        if i == 1 and mask is not None and kp1_used is not None and gray_ref is not None:
+            plot_image_with_mask(prev_img, mask, title=f"Reference Image {prev_date} with Stable Mask Overlay", save_path=os.path.join(config.PLOTS_DIR, "reference_with_mask_overlay.png"))
+            img_with_keypoints = cv2.drawKeypoints(gray_ref, kp1_used, None, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+            plt.imshow(img_with_keypoints, cmap='gray')
+            plt.title(f"Keypoints on Grayscale Reference Image {prev_date}")
+            plt.axis('off')
+            plt.savefig(os.path.join(config.PLOTS_DIR, "keypoints_on_grayscale.png"))
+            plt.show()
 
-    # --- 5. Detection ---
-    print("Detecting changes...")
-    change_mask = detect_landslide_changes(
-        img1_crop, 
-        img2_corrected, 
-        blur_k=config.BLUR_KERNEL_SIZE,
-        min_area=config.MIN_LANDSLIDE_AREA
-    )
+    # --- 3. Save aligned images as georeferenced TIFFs ---
+    print("\nSaving aligned images...")
+    for i, (img_aligned, profile, img_path) in enumerate(zip(aligned_images, profiles, image_paths)):
+        base_name = os.path.splitext(os.path.basename(img_path))[0]
+        output_filename = f"{base_name}_aligned.tif"
+        output_path = os.path.join(config.ALIGNED_IMAGES_DIR, output_filename)
+        profile_copy = profile.copy()
+        profile_copy.update(width=img_aligned.shape[1], height=img_aligned.shape[0], count=3, dtype=img_aligned.dtype)
+        with rasterio.open(output_path, 'w', **profile_copy) as dst:
+            dst.write(np.transpose(img_aligned, (2, 0, 1)))
+        print(f"Saved aligned image {i}: {output_path}")
 
-    # Plot reference image with translucent change mask
-    from src.visualization import plot_image_with_change_mask
-    plot_image_with_change_mask(img1_crop, change_mask, title="Reference Image with Detected Changes", save_path=os.path.join(config.OUTPUT_DIR, "change_detection_overlay.jpg"))
-
-    # --- 5.5 Dense Displacement Field ---
-    print("Computing dense displacement field...")
-    from src.processing import compute_dense_displacement, visualize_displacement_field
-    flow = compute_dense_displacement(img1_crop, img2_corrected, mask_crop)
-    visualize_displacement_field(img1_crop, flow, save_path=os.path.join(config.OUTPUT_DIR, "displacement_field.jpg"))
-
-    # --- 6. Visualization & Save ---
-    # print("Visualizing results...")
-    
-    # # Create a red overlay for the changes
-    # result_visual = img2_crop.copy()
-    # # Paint the mask area Red (BGR format: 0, 0, 255)
-    # result_visual[change_mask == 255] = [0, 0, 255]
-
-    # # Save to disk
-    # save_result("change_mask.jpg", change_mask, config.OUTPUT_DIR)
-    # save_result("final_overlay.jpg", result_visual, config.OUTPUT_DIR)
-
-    # # Display safely (Matplotlib)
-    # preview_images(
-    #     [img1_crop, img2_corrected, change_mask, result_visual], 
-    #     ["Date 1", "Date 2 (Aligned & Corrected)", "Change Mask", "Landslide Detection"]
-    # )
+    # --- 4-5. Process consecutive image pairs ---
+    print("\nProcessing consecutive image pairs...")
+    for i in range(1, len(aligned_images)):
+        prev_img = aligned_images[i-1]
+        curr_img = aligned_images[i]
+        prev_profile = profiles[i-1]
+        curr_profile = profiles[i]
+        prev_date = extract_date(image_paths[i-1])
+        curr_date = extract_date(image_paths[i])
+        print(f"\n--- Processing pair: {prev_date} vs {curr_date} ---")
+        process_image_pair(
+            prev_img,
+            prev_profile,
+            curr_img,
+            curr_profile,
+            mask,
+            i,
+            config.PLOTS_DIR,
+            prev_date=prev_date,
+            curr_date=curr_date
+        )
 
 if __name__ == "__main__":
     main()
